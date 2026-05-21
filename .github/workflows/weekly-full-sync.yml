@@ -1,0 +1,137 @@
+# .github/workflows/weekly-full-sync.yml
+#
+# Sync FULL settimanale Zoho (Desk + SalesIQ)
+# ─────────────────────────────────────────────
+#
+# COSA FA:
+#   1. zoho-sync-desk?mode=full     → riconcilia ticket fantasma (Assistenza + Sviluppo)
+#   2. Pausa 60s
+#   3. zoho-sync-salesiq?mode=bulk  → deep refresh ultime ~2.970 chat
+#
+# QUANDO PARTE:
+#   - Automatico: ogni lunedì alle 04:00 UTC (05:00 IT in inverno, 06:00 IT in estate)
+#     → prima del cron giornaliero delle 05:00 UTC
+#   - Manuale: dal tab "Actions" → "Weekly FULL Sync" → "Run workflow"
+#
+# FAIL-FAST:
+#   Se zoho-sync-desk fallisce, il workflow si ferma e SalesIQ NON parte.
+#   In questo modo vedi subito che c'è un problema invece di mascherarlo.
+#
+# ─────────────────────────────────────────────
+# VERIFICA PRIMA DEL COMMIT:
+#   1. I secrets SUPABASE_URL e SUPABASE_ANON_KEY esistono già? (sono quelli usati
+#      da daily-chat-sync.yml). Se hanno nomi diversi, sostituiscili sotto.
+#   2. L'URL base delle Edge Functions è giusto? Standard Supabase:
+#      https://<project-ref>.supabase.co/functions/v1/<function-name>
+# ─────────────────────────────────────────────
+
+name: Weekly FULL Sync
+
+on:
+  schedule:
+    # Ogni lunedì alle 04:00 UTC (cron usa UTC, non timezone locale)
+    - cron: "0 4 * * 1"
+  workflow_dispatch: # bottone "Run workflow" manuale
+
+jobs:
+  full-sync:
+    name: Desk FULL + SalesIQ bulk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ───────────────────────────────────────
+      # STEP 1 — zoho-sync-desk FULL
+      # Riconcilia ticket fantasma (Assistenza + Sviluppo) marcando come
+      # "Chiuso" quelli APERTI nel DB che non tornano più dal sync FULL.
+      # ───────────────────────────────────────
+      - name: "Desk FULL — riconciliazione ticket fantasma"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          echo "▶ Avvio zoho-sync-desk in mode=full..."
+          START_TS=$(date +%s)
+
+          HTTP_CODE=$(curl --silent --show-error \
+            --max-time 600 \
+            --write-out "%{http_code}" \
+            --output /tmp/desk_response.json \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            "$SUPABASE_URL/functions/v1/zoho-sync-desk?mode=full")
+
+          ELAPSED=$(( $(date +%s) - START_TS ))
+          echo "⏱  Durata: ${ELAPSED}s — HTTP: $HTTP_CODE"
+          echo "📄 Risposta:"
+          cat /tmp/desk_response.json
+          echo ""
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Desk FULL fallito (HTTP $HTTP_CODE). Stop workflow."
+            exit 1
+          fi
+          echo "✅ Desk FULL completato"
+
+      # ───────────────────────────────────────
+      # STEP 2 — Pausa di sicurezza
+      # Lascia respirare Edge Functions e Zoho API prima di SalesIQ
+      # ───────────────────────────────────────
+      - name: "Pausa 60 secondi"
+        run: |
+          echo "⏸  Attesa 60s prima di SalesIQ..."
+          sleep 60
+
+      # ───────────────────────────────────────
+      # STEP 3 — zoho-sync-salesiq bulk
+      # Scarica fino a 30 pagine × 99 chat = ~2.970 chat recenti.
+      # Copre ampiamente l'ultima settimana + cuscino.
+      # ───────────────────────────────────────
+      - name: "SalesIQ bulk — deep refresh chat"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          echo "▶ Avvio zoho-sync-salesiq in mode=bulk (page=1)..."
+          START_TS=$(date +%s)
+
+          HTTP_CODE=$(curl --silent --show-error \
+            --max-time 600 \
+            --write-out "%{http_code}" \
+            --output /tmp/salesiq_response.json \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            "$SUPABASE_URL/functions/v1/zoho-sync-salesiq?mode=bulk&page=1")
+
+          ELAPSED=$(( $(date +%s) - START_TS ))
+          echo "⏱  Durata: ${ELAPSED}s — HTTP: $HTTP_CODE"
+          echo "📄 Risposta:"
+          cat /tmp/salesiq_response.json
+          echo ""
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ SalesIQ bulk fallito (HTTP $HTTP_CODE). Stop workflow."
+            exit 1
+          fi
+
+          # Mostra il riassunto per leggibilità nei log
+          SYNCED=$(jq -r '.synced_in_this_call // "?"' /tmp/salesiq_response.json 2>/dev/null || echo "?")
+          PAGES=$(jq -r '.pages_fetched // "?"' /tmp/salesiq_response.json 2>/dev/null || echo "?")
+          HAS_MORE=$(jq -r '.has_more // "?"' /tmp/salesiq_response.json 2>/dev/null || echo "?")
+          echo "✅ SalesIQ bulk completato: $SYNCED chat in $PAGES pagine (has_more: $HAS_MORE)"
+
+      # ───────────────────────────────────────
+      # STEP 4 — Riepilogo finale
+      # ───────────────────────────────────────
+      - name: "Riepilogo"
+        if: always()
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  WEEKLY FULL SYNC — Completato"
+          echo "═══════════════════════════════════════"
+          echo "Data: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "Job status: ${{ job.status }}"

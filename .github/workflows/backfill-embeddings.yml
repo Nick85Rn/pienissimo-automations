@@ -1,0 +1,142 @@
+# .github/workflows/backfill-embeddings.yml
+#
+# Backfill embeddings — one-shot, manuale
+# ─────────────────────────────────────────────
+#
+# COSA FA:
+#   Chiama generate-chat-embeddings in loop con limit=100, finché non ci sono
+#   più chat da processare (o finché non raggiunge il limite di sicurezza).
+#
+# QUANDO LANCIARLO:
+#   - Solo manuale, dal tab "Actions" → "Backfill Embeddings" → "Run workflow"
+#   - Non schedulato (è una operazione una tantum dopo setup iniziale o
+#     dopo modifiche allo schema)
+#
+# COMPORTAMENTO:
+#   - Massimo MAX_ITERATIONS chiamate (per evitare loop infiniti)
+#   - Pausa 5s tra una chiamata e l'altra (gentile con OpenAI rate limit)
+#   - Si ferma se una chiamata processa 0 chat (significa: backfill completo)
+#   - Logga tutto: chat fatte, chunk inseriti, token usati, costo totale stimato
+# ─────────────────────────────────────────────
+
+name: Backfill Embeddings
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit_per_call:
+        description: "Chat per chiamata (default 100, max 200)"
+        required: false
+        default: "100"
+      max_iterations:
+        description: "Numero max di chiamate (safety, default 200 = 20.000 chat)"
+        required: false
+        default: "200"
+
+jobs:
+  backfill:
+    name: Loop embeddings until empty
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Backfill loop
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          LIMIT_PER_CALL: ${{ inputs.limit_per_call }}
+          MAX_ITERATIONS: ${{ inputs.max_iterations }}
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  BACKFILL EMBEDDINGS"
+          echo "═══════════════════════════════════════"
+          echo "Limit per call:  $LIMIT_PER_CALL"
+          echo "Max iterations:  $MAX_ITERATIONS"
+          echo "Started at:      $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          TOTAL_CHATS=0
+          TOTAL_CHUNKS=0
+          TOTAL_TOKENS=0
+          TOTAL_ERRORS=0
+          ITERATIONS=0
+          START_TS=$(date +%s)
+
+          while [ $ITERATIONS -lt $MAX_ITERATIONS ]; do
+            ITERATIONS=$((ITERATIONS + 1))
+            ITER_START=$(date +%s)
+
+            echo "──────────────────────────────────────"
+            echo "▶ Iterazione $ITERATIONS / $MAX_ITERATIONS"
+
+            HTTP_CODE=$(curl --silent --show-error \
+              --max-time 300 \
+              --write-out "%{http_code}" \
+              --output /tmp/embed_response.json \
+              -X POST \
+              -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/functions/v1/generate-chat-embeddings?limit=$LIMIT_PER_CALL")
+
+            ITER_ELAPSED=$(( $(date +%s) - ITER_START ))
+
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "❌ HTTP $HTTP_CODE — Risposta:"
+              cat /tmp/embed_response.json
+              echo ""
+              echo "Stop loop per errore."
+              exit 1
+            fi
+
+            # Parse statistiche dalla risposta JSON
+            OK=$(jq -r '.ok' /tmp/embed_response.json)
+            CHATS=$(jq -r '.stats.chats_processed // 0' /tmp/embed_response.json)
+            EXAMINED=$(jq -r '.stats.chats_examined // 0' /tmp/embed_response.json)
+            CHUNKS=$(jq -r '.stats.chunks_inserted // 0' /tmp/embed_response.json)
+            TOKENS=$(jq -r '.stats.tokens_used // 0' /tmp/embed_response.json)
+            ERRORS=$(jq -r '.stats.errors | length' /tmp/embed_response.json)
+            MESSAGE=$(jq -r '.message // ""' /tmp/embed_response.json)
+
+            TOTAL_CHATS=$((TOTAL_CHATS + CHATS))
+            TOTAL_CHUNKS=$((TOTAL_CHUNKS + CHUNKS))
+            TOTAL_TOKENS=$((TOTAL_TOKENS + TOKENS))
+            TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
+
+            echo "   ↳ ok: $OK | message: $MESSAGE"
+            echo "   ↳ chat: $CHATS/$EXAMINED | chunk: $CHUNKS | token: $TOKENS | errors: $ERRORS | tempo: ${ITER_ELAPSED}s"
+            echo "   ↳ TOTALI finora: chat=$TOTAL_CHATS, chunk=$TOTAL_CHUNKS, token=$TOTAL_TOKENS"
+
+            # Stop conditions
+            if [ "$EXAMINED" -eq 0 ]; then
+              echo ""
+              echo "🎉 Nessuna chat da processare. Backfill completato!"
+              break
+            fi
+
+            if [ "$CHATS" -eq 0 ] && [ "$EXAMINED" -gt 0 ]; then
+              echo ""
+              echo "⚠️  $EXAMINED chat esaminate ma 0 processate. Probabile blocco — stop."
+              break
+            fi
+
+            # Pausa gentile con OpenAI rate limit
+            sleep 5
+          done
+
+          TOTAL_ELAPSED=$(( $(date +%s) - START_TS ))
+          # Costo stimato: text-embedding-3-small = $0.02 per 1M token
+          COST_CENTS=$(echo "scale=4; $TOTAL_TOKENS * 0.02 / 10000" | bc 2>/dev/null || echo "0")
+
+          echo ""
+          echo "═══════════════════════════════════════"
+          echo "  RIEPILOGO BACKFILL"
+          echo "═══════════════════════════════════════"
+          echo "Iterazioni:         $ITERATIONS"
+          echo "Chat processate:    $TOTAL_CHATS"
+          echo "Chunk inseriti:     $TOTAL_CHUNKS"
+          echo "Token totali:       $TOTAL_TOKENS"
+          echo "Errori:             $TOTAL_ERRORS"
+          echo "Tempo totale:       ${TOTAL_ELAPSED}s ($(($TOTAL_ELAPSED / 60))m $(($TOTAL_ELAPSED % 60))s)"
+          echo "Costo stimato:      \$$COST_CENTS"
+          echo "Finished at:        $(date -u +'%Y-%m-%d %H:%M:%S UTC')"

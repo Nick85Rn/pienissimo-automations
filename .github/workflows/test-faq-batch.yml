@@ -1,7 +1,4 @@
 # .github/workflows/test-faq-batch.yml
-# Test on-demand della Edge Function process-faq-batch
-# Lancia dry run, vedi output JSON nei log
-
 name: Test FAQ Batch
 
 on:
@@ -15,6 +12,10 @@ on:
         description: "Dry run (true/false)"
         required: false
         default: "true"
+      chat_id:
+        description: "Force specific chat_id (optional, bypassa la logica di selezione)"
+        required: false
+        default: ""
 
 jobs:
   test:
@@ -27,8 +28,14 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           LIMIT: ${{ inputs.limit }}
           DRY_RUN: ${{ inputs.dry_run }}
+          CHAT_ID: ${{ inputs.chat_id }}
         run: |
-          echo "▶ Calling process-faq-batch (limit=$LIMIT, dry_run=$DRY_RUN)..."
+          QS="limit=$LIMIT&dry_run=$DRY_RUN"
+          if [ -n "$CHAT_ID" ]; then
+            QS="$QS&chat_id=$CHAT_ID"
+          fi
+          
+          echo "▶ Calling process-faq-batch ($QS)..."
           
           HTTP_CODE=$(curl --silent --show-error \
             --max-time 300 \
@@ -38,7 +45,7 @@ jobs:
             -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
             -H "apikey: $SUPABASE_ANON_KEY" \
             -H "Content-Type: application/json" \
-            "$SUPABASE_URL/functions/v1/process-faq-batch?limit=$LIMIT&dry_run=$DRY_RUN")
+            "$SUPABASE_URL/functions/v1/process-faq-batch?$QS")
           
           echo "═══════════════════════════════════════"
           echo "HTTP Status: $HTTP_CODE"

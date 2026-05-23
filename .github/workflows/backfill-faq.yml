@@ -1,0 +1,152 @@
+# .github/workflows/backfill-faq.yml
+#
+# Backfill FAQ — genera Q&A AI + embedding per chat resolved=true
+# ─────────────────────────────────────────────
+#
+# COSA FA:
+#   Chiama process-faq-batch in loop con limit=50, finché non raggiunge
+#   il target di chat processate (o esaurisce le pending).
+#
+# QUANDO LANCIARLO:
+#   - Manuale dal tab "Actions" → "Backfill FAQ" → "Run workflow"
+#
+# COSTI ATTESI:
+#   ~$0.0009 per chat (Claude Haiku batch + OpenAI embedding)
+#   500 chat = ~$0.50
+#   9.246 chat (totale) = ~$8.50
+#
+# ─────────────────────────────────────────────
+
+name: Backfill FAQ
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_total:
+        description: "Numero totale chat da processare (es. 500)"
+        required: false
+        default: "500"
+      limit_per_call:
+        description: "Chat per chiamata (max 200, raccomandato 50 per sicurezza)"
+        required: false
+        default: "50"
+      max_iterations:
+        description: "Numero max chiamate (safety, default 30)"
+        required: false
+        default: "30"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Backfill loop
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          TARGET_TOTAL: ${{ inputs.target_total }}
+          LIMIT_PER_CALL: ${{ inputs.limit_per_call }}
+          MAX_ITERATIONS: ${{ inputs.max_iterations }}
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  BACKFILL FAQ"
+          echo "═══════════════════════════════════════"
+          echo "Target totale:    $TARGET_TOTAL chat"
+          echo "Limit per call:   $LIMIT_PER_CALL"
+          echo "Max iterations:   $MAX_ITERATIONS"
+          echo "Started at:       $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          TOTAL_PROCESSED=0
+          TOTAL_CANDIDATES=0
+          TOTAL_TOKENS_CLAUDE=0
+          TOTAL_TOKENS_OPENAI=0
+          TOTAL_ERRORS=0
+          ITERATIONS=0
+          START_TS=$(date +%s)
+
+          while [ $ITERATIONS -lt $MAX_ITERATIONS ] && [ $TOTAL_PROCESSED -lt $TARGET_TOTAL ]; do
+            ITERATIONS=$((ITERATIONS + 1))
+            ITER_START=$(date +%s)
+
+            echo "──────────────────────────────────────"
+            echo "▶ Iterazione $ITERATIONS / $MAX_ITERATIONS — processati finora: $TOTAL_PROCESSED / $TARGET_TOTAL"
+
+            HTTP_CODE=$(curl --silent --show-error \
+              --max-time 600 \
+              --write-out "%{http_code}" \
+              --output /tmp/faq_response.json \
+              -X POST \
+              -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/functions/v1/process-faq-batch?limit=$LIMIT_PER_CALL")
+
+            ITER_ELAPSED=$(( $(date +%s) - ITER_START ))
+
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "❌ HTTP $HTTP_CODE — Response:"
+              cat /tmp/faq_response.json
+              echo ""
+              echo "Stop loop per errore."
+              exit 1
+            fi
+
+            OK=$(jq -r '.ok' /tmp/faq_response.json)
+            CANDIDATES=$(jq -r '.stats.candidates // 0' /tmp/faq_response.json)
+            PROCESSED=$(jq -r '.stats.processed // 0' /tmp/faq_response.json)
+            TOKENS_C=$(jq -r '.stats.tokens_claude // 0' /tmp/faq_response.json)
+            TOKENS_O=$(jq -r '.stats.tokens_openai // 0' /tmp/faq_response.json)
+            ERRORS=$(jq -r '.stats.errors | length' /tmp/faq_response.json)
+            MESSAGE=$(jq -r '.message // ""' /tmp/faq_response.json)
+
+            TOTAL_PROCESSED=$((TOTAL_PROCESSED + PROCESSED))
+            TOTAL_CANDIDATES=$((TOTAL_CANDIDATES + CANDIDATES))
+            TOTAL_TOKENS_CLAUDE=$((TOTAL_TOKENS_CLAUDE + TOKENS_C))
+            TOTAL_TOKENS_OPENAI=$((TOTAL_TOKENS_OPENAI + TOKENS_O))
+            TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
+
+            echo "   ↳ ok: $OK | $MESSAGE"
+            echo "   ↳ candidati: $CANDIDATES | processed: $PROCESSED | errors: $ERRORS | tempo: ${ITER_ELAPSED}s"
+            echo "   ↳ TOTALI: chat=$TOTAL_PROCESSED, tokens_claude=$TOTAL_TOKENS_CLAUDE, tokens_openai=$TOTAL_TOKENS_OPENAI"
+
+            # Stop se non ci sono più candidati
+            if [ "$CANDIDATES" -eq 0 ]; then
+              echo ""
+              echo "🎉 Nessuna chat pending. Backfill completato!"
+              break
+            fi
+
+            # Stop se ha processato 0 ma c'erano candidati (potrebbe esserci un blocco)
+            if [ "$PROCESSED" -eq 0 ] && [ "$CANDIDATES" -gt 0 ]; then
+              echo ""
+              echo "⚠️  $CANDIDATES candidati ma 0 processati. Probabile errore — stop."
+              break
+            fi
+
+            # Pausa gentile prima del prossimo round
+            sleep 10
+          done
+
+          TOTAL_ELAPSED=$(( $(date +%s) - START_TS ))
+          
+          # Costo stimato:
+          # Haiku 4.5: $1/1M input + $5/1M output (approx 80% input, 20% output)
+          # OpenAI text-embedding-3-small: $0.02/1M token
+          CLAUDE_COST=$(echo "scale=4; ($TOTAL_TOKENS_CLAUDE * 0.8 * 1.0 + $TOTAL_TOKENS_CLAUDE * 0.2 * 5.0) / 1000000" | bc 2>/dev/null || echo "0")
+          OPENAI_COST=$(echo "scale=4; $TOTAL_TOKENS_OPENAI * 0.02 / 1000000" | bc 2>/dev/null || echo "0")
+
+          echo ""
+          echo "═══════════════════════════════════════"
+          echo "  RIEPILOGO BACKFILL FAQ"
+          echo "═══════════════════════════════════════"
+          echo "Iterazioni:           $ITERATIONS"
+          echo "Chat processate:      $TOTAL_PROCESSED"
+          echo "Errori:               $TOTAL_ERRORS"
+          echo "Tokens Claude:        $TOTAL_TOKENS_CLAUDE"
+          echo "Tokens OpenAI:        $TOTAL_TOKENS_OPENAI"
+          echo "Costo Claude (stim):  \$$CLAUDE_COST"
+          echo "Costo OpenAI (stim):  \$$OPENAI_COST"
+          echo "Tempo totale:         ${TOTAL_ELAPSED}s ($(($TOTAL_ELAPSED / 60))m $(($TOTAL_ELAPSED % 60))s)"
+          echo "Finished at:          $(date -u +'%Y-%m-%d %H:%M:%S UTC')"

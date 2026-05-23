@@ -1,0 +1,55 @@
+# .github/workflows/test-faq-batch.yml
+# Test on-demand della Edge Function process-faq-batch
+# Lancia dry run, vedi output JSON nei log
+
+name: Test FAQ Batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Chat da processare (default 5)"
+        required: false
+        default: "5"
+      dry_run:
+        description: "Dry run (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call process-faq-batch
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          LIMIT: ${{ inputs.limit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          echo "▶ Calling process-faq-batch (limit=$LIMIT, dry_run=$DRY_RUN)..."
+          
+          HTTP_CODE=$(curl --silent --show-error \
+            --max-time 300 \
+            --write-out "%{http_code}" \
+            --output /tmp/response.json \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            "$SUPABASE_URL/functions/v1/process-faq-batch?limit=$LIMIT&dry_run=$DRY_RUN")
+          
+          echo "═══════════════════════════════════════"
+          echo "HTTP Status: $HTTP_CODE"
+          echo "═══════════════════════════════════════"
+          echo "Response body:"
+          cat /tmp/response.json | jq . || cat /tmp/response.json
+          echo ""
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Test failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          
+          echo "✅ Test completed"

@@ -1,62 +1,45 @@
-# .github/workflows/test-faq-batch.yml
-name: Test FAQ Batch
+name: Test Build Bundle
 
 on:
   workflow_dispatch:
-    inputs:
-      limit:
-        description: "Chat da processare (default 5)"
-        required: false
-        default: "5"
-      dry_run:
-        description: "Dry run (true/false)"
-        required: false
-        default: "true"
-      chat_id:
-        description: "Force specific chat_id (optional, bypassa la logica di selezione)"
-        required: false
-        default: ""
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - name: Call process-faq-batch
+      - name: Call build-faq-bundle
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          LIMIT: ${{ inputs.limit }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          CHAT_ID: ${{ inputs.chat_id }}
         run: |
-          QS="limit=$LIMIT&dry_run=$DRY_RUN"
-          if [ -n "$CHAT_ID" ]; then
-            QS="$QS&chat_id=$CHAT_ID"
-          fi
-          
-          echo "▶ Calling process-faq-batch ($QS)..."
+          echo "▶ Calling build-faq-bundle..."
           
           HTTP_CODE=$(curl --silent --show-error \
-            --max-time 300 \
+            --max-time 60 \
             --write-out "%{http_code}" \
-            --output /tmp/response.json \
+            --output /tmp/bundle.json \
+            -D /tmp/headers.txt \
             -X POST \
             -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
             -H "apikey: $SUPABASE_ANON_KEY" \
-            -H "Content-Type: application/json" \
-            "$SUPABASE_URL/functions/v1/process-faq-batch?$QS")
+            "$SUPABASE_URL/functions/v1/build-faq-bundle?format=full")
           
-          echo "═══════════════════════════════════════"
           echo "HTTP Status: $HTTP_CODE"
-          echo "═══════════════════════════════════════"
-          echo "Response body:"
-          cat /tmp/response.json | jq . || cat /tmp/response.json
           echo ""
-          
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "❌ Test failed (HTTP $HTTP_CODE)"
-            exit 1
-          fi
-          
-          echo "✅ Test completed"
+          echo "Response headers:"
+          cat /tmp/headers.txt | grep -i "^x-\|^content-type\|^cache-control"
+          echo ""
+          echo "Bundle size: $(wc -c < /tmp/bundle.json) bytes"
+          echo "Compressed (gzip): $(gzip -c /tmp/bundle.json | wc -c) bytes"
+          echo ""
+          echo "First-level keys:"
+          jq 'keys' /tmp/bundle.json
+          echo ""
+          echo "FAQ stats:"
+          jq '.faqs.stats' /tmp/bundle.json
+          echo ""
+          echo "Search index documents count:"
+          jq '.index.documents | length' /tmp/bundle.json
+          echo ""
+          echo "Sample FAQ (first):"
+          jq '.faqs.faqs[0]' /tmp/bundle.json

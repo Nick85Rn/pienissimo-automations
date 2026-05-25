@@ -1,0 +1,65 @@
+# .github/workflows/test-faq-batch.yml
+# Test on-demand della Edge Function process-faq-batch
+# Lancia con limit basso + dry_run per non spendere crediti
+
+name: Test FAQ Batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Chat da processare (default 5)"
+        required: false
+        default: "5"
+      dry_run:
+        description: "Dry run (true/false)"
+        required: false
+        default: "true"
+      chat_id:
+        description: "Force specific chat_id (optional, bypassa la logica di selezione)"
+        required: false
+        default: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call process-faq-batch
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          LIMIT: ${{ inputs.limit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          QS="limit=$LIMIT&dry_run=$DRY_RUN"
+          if [ -n "$CHAT_ID" ]; then
+            QS="$QS&chat_id=$CHAT_ID"
+          fi
+          
+          echo "▶ Calling process-faq-batch ($QS)..."
+          
+          HTTP_CODE=$(curl --silent --show-error \
+            --max-time 300 \
+            --write-out "%{http_code}" \
+            --output /tmp/response.json \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            "$SUPABASE_URL/functions/v1/process-faq-batch?$QS")
+          
+          echo "═══════════════════════════════════════"
+          echo "HTTP Status: $HTTP_CODE"
+          echo "═══════════════════════════════════════"
+          echo "Response body:"
+          cat /tmp/response.json | jq . || cat /tmp/response.json
+          echo ""
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Test failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          
+          echo "✅ Test completed"

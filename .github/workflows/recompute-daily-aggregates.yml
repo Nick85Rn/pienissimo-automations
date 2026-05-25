@@ -1,0 +1,95 @@
+# .github/workflows/recompute-daily-aggregates.yml
+#
+# Recompute degli aggregati daily Pienissimo
+# Chiama tutte le funzioni recompute_* di Postgres via Supabase RPC.
+# Gira 3 volte al giorno per tenere la dashboard sempre fresca.
+#
+# Funzioni chiamate:
+#   - recompute_daily_assistenza
+#   - recompute_daily_sviluppo
+#   - recompute_daily_chats
+#   - recompute_daily_formazioni
+#   - recompute_daily_sla
+#   - recompute_chat_heatmap
+
+name: Recompute Daily Aggregates
+
+on:
+  schedule:
+    # 07:00 UTC = 09:00 it estate, 08:00 it inverno (apertura uffici)
+    # 13:00 UTC = 15:00 it estate, 14:00 it inverno (dopo pranzo)
+    # 19:00 UTC = 21:00 it estate, 20:00 it inverno (fine giornata)
+    - cron: '0 7,13,19 * * *'
+  workflow_dispatch:
+
+jobs:
+  recompute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Call all recompute functions
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  RECOMPUTE DAILY AGGREGATES"
+          echo "═══════════════════════════════════════"
+          echo "Started at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          FUNCTIONS=(
+            "recompute_daily_assistenza"
+            "recompute_daily_sviluppo"
+            "recompute_daily_chats"
+            "recompute_daily_formazioni"
+            "recompute_daily_sla"
+            "recompute_chat_heatmap"
+          )
+
+          OVERALL_OK=true
+          
+          for fn in "${FUNCTIONS[@]}"; do
+            echo "▶ Calling $fn..."
+            START=$(date +%s)
+            
+            HTTP_CODE=$(curl --silent --show-error \
+              --max-time 120 \
+              --write-out "%{http_code}" \
+              --output /tmp/rpc_response.json \
+              -X POST \
+              -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{}' \
+              "$SUPABASE_URL/rest/v1/rpc/$fn")
+            
+            ELAPSED=$(( $(date +%s) - START ))
+            
+            if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 204 ]; then
+              echo "   ✅ $fn → HTTP $HTTP_CODE in ${ELAPSED}s"
+            else
+              echo "   ❌ $fn → HTTP $HTTP_CODE in ${ELAPSED}s"
+              echo "   Response:"
+              cat /tmp/rpc_response.json
+              echo ""
+              OVERALL_OK=false
+            fi
+            
+            sleep 2
+          done
+
+          echo ""
+          echo "═══════════════════════════════════════"
+          if [ "$OVERALL_OK" = true ]; then
+            echo "  ✅ Tutti i recompute completati con successo"
+          else
+            echo "  ⚠️  Alcuni recompute hanno fallito (vedi sopra)"
+          fi
+          echo "═══════════════════════════════════════"
+          echo "Finished at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          
+          if [ "$OVERALL_OK" = false ]; then
+            exit 1
+          fi

@@ -25,9 +25,9 @@ on:
       target_total:
         description: "Numero totale chat da processare (es. 500)"
         required: false
-        default: "500"
+        default: "25"
       limit_per_call:
-        description: "Chat per chiamata (max 200, raccomandato 50 per sicurezza)"
+        description: "Chat per chiamata (max 200, raccomandato 25 per sicurezza)"
         required: false
         default: "50"
       max_iterations:

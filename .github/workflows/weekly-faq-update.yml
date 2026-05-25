@@ -1,0 +1,159 @@
+# .github/workflows/weekly-faq-update.yml
+#
+# Aggiornamento settimanale FAQ — automatico ogni lunedì 06:00 UTC.
+# Processa fino a 150 chat resolved nuove con AI Q&A + embedding.
+#
+# Le chat già processate vengono saltate automaticamente dall'anti-join
+# in process-faq-batch.
+#
+# Costo medio per esecuzione: ~$0.10-0.15
+# Tempo medio: 10-15 minuti
+
+name: Weekly FAQ Update
+
+on:
+  schedule:
+    # Lunedì 06:00 UTC = 08:00 ora italiana estate, 07:00 ora italiana inverno
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      target_total:
+        description: "Numero max chat da processare (default 150)"
+        required: false
+        default: "150"
+
+jobs:
+  weekly-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Process new FAQs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          TARGET_TOTAL: ${{ inputs.target_total || '150' }}
+        run: |
+          LIMIT_PER_CALL=25
+          MAX_ITERATIONS=10
+
+          echo "═══════════════════════════════════════"
+          echo "  WEEKLY FAQ UPDATE"
+          echo "═══════════════════════════════════════"
+          echo "Target totale:        $TARGET_TOTAL chat"
+          echo "Limit per call:       $LIMIT_PER_CALL"
+          echo "Started at:           $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          # Snapshot iniziale: quante FAQ ci sono prima
+          INITIAL_COUNT=$(curl --silent \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            "$SUPABASE_URL/rest/v1/chat_faq?select=count" \
+            -H "Prefer: count=exact" \
+            -H "Range: 0-0" \
+            -I 2>/dev/null | grep -i "content-range:" | grep -oE '[0-9]+$' || echo "?")
+          echo "FAQ in DB all'inizio:  $INITIAL_COUNT"
+          echo ""
+
+          TOTAL_PROCESSED=0
+          TOTAL_TOKENS_CLAUDE=0
+          TOTAL_TOKENS_OPENAI=0
+          TOTAL_ERRORS=0
+          ITERATIONS=0
+          START_TS=$(date +%s)
+          STOP_REASON=""
+
+          while [ $ITERATIONS -lt $MAX_ITERATIONS ] && [ $TOTAL_PROCESSED -lt $TARGET_TOTAL ]; do
+            ITERATIONS=$((ITERATIONS + 1))
+            ITER_START=$(date +%s)
+
+            echo "▶ Iter $ITERATIONS/$MAX_ITERATIONS | processati: $TOTAL_PROCESSED/$TARGET_TOTAL"
+
+            HTTP_CODE=$(curl --silent --show-error \
+              --max-time 600 \
+              --write-out "%{http_code}" \
+              --output /tmp/faq_response.json \
+              -X POST \
+              -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/functions/v1/process-faq-batch?limit=$LIMIT_PER_CALL")
+
+            ITER_ELAPSED=$(( $(date +%s) - ITER_START ))
+
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "❌ HTTP $HTTP_CODE"
+              cat /tmp/faq_response.json
+              echo ""
+              if [ "$HTTP_CODE" = "546" ] || [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "503" ]; then
+                echo "⏸️  Errore temporaneo: aspetto 30s e ritento..."
+                sleep 30
+                continue
+              fi
+              STOP_REASON="HTTP_ERROR $HTTP_CODE"
+              break
+            fi
+
+            CANDIDATES=$(jq -r '.stats.candidates // 0' /tmp/faq_response.json)
+            PROCESSED=$(jq -r '.stats.processed // 0' /tmp/faq_response.json)
+            TOKENS_C=$(jq -r '.stats.tokens_claude // 0' /tmp/faq_response.json)
+            TOKENS_O=$(jq -r '.stats.tokens_openai // 0' /tmp/faq_response.json)
+            ERRORS=$(jq -r '.stats.errors | length' /tmp/faq_response.json)
+            MESSAGE=$(jq -r '.message // ""' /tmp/faq_response.json)
+
+            TOTAL_PROCESSED=$((TOTAL_PROCESSED + PROCESSED))
+            TOTAL_TOKENS_CLAUDE=$((TOTAL_TOKENS_CLAUDE + TOKENS_C))
+            TOTAL_TOKENS_OPENAI=$((TOTAL_TOKENS_OPENAI + TOKENS_O))
+            TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
+
+            echo "   ↳ $MESSAGE"
+            echo "   ↳ cand: $CANDIDATES | proc: $PROCESSED | err: $ERRORS | t: ${ITER_ELAPSED}s"
+
+            if [ "$CANDIDATES" -eq 0 ]; then
+              STOP_REASON="UP_TO_DATE (no new FAQs to process)"
+              echo ""
+              echo "✅ Knowledge base aggiornata. Nessuna nuova chat da processare."
+              break
+            fi
+
+            if [ "$PROCESSED" -eq 0 ] && [ "$CANDIDATES" -gt 0 ]; then
+              STOP_REASON="ALL_FAILED"
+              echo "⚠️  Candidati ma 0 processati — stop."
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "$STOP_REASON" ]; then
+            STOP_REASON="TARGET_REACHED"
+          fi
+
+          TOTAL_ELAPSED=$(( $(date +%s) - START_TS ))
+          CLAUDE_COST=$(echo "scale=4; ($TOTAL_TOKENS_CLAUDE * 0.8 * 1.0 + $TOTAL_TOKENS_CLAUDE * 0.2 * 5.0) / 1000000" | bc 2>/dev/null || echo "0")
+          OPENAI_COST=$(echo "scale=4; $TOTAL_TOKENS_OPENAI * 0.02 / 1000000" | bc 2>/dev/null || echo "0")
+
+          # Snapshot finale
+          FINAL_COUNT=$(curl --silent \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            "$SUPABASE_URL/rest/v1/chat_faq?select=count" \
+            -H "Prefer: count=exact" \
+            -H "Range: 0-0" \
+            -I 2>/dev/null | grep -i "content-range:" | grep -oE '[0-9]+$' || echo "?")
+
+          echo ""
+          echo "═══════════════════════════════════════"
+          echo "  RIEPILOGO WEEKLY UPDATE"
+          echo "═══════════════════════════════════════"
+          echo "Stop reason:          $STOP_REASON"
+          echo "FAQ in DB inizio:     $INITIAL_COUNT"
+          echo "FAQ in DB ora:        $FINAL_COUNT"
+          echo "Nuove FAQ aggiunte:   $TOTAL_PROCESSED"
+          echo "Errori:               $TOTAL_ERRORS"
+          echo "Tokens Claude:        $TOTAL_TOKENS_CLAUDE"
+          echo "Tokens OpenAI:        $TOTAL_TOKENS_OPENAI"
+          echo "Costo totale (stim):  \$$(echo "scale=4; $CLAUDE_COST + $OPENAI_COST" | bc 2>/dev/null || echo "0")"
+          echo "Tempo totale:         ${TOTAL_ELAPSED}s ($(($TOTAL_ELAPSED / 60))m)"
+          echo "Finished at:          $(date -u +'%Y-%m-%d %H:%M:%S UTC')"

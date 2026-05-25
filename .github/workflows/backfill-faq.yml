@@ -1,21 +1,7 @@
 # .github/workflows/backfill-faq.yml
 #
-# Backfill FAQ — genera Q&A AI + embedding per chat resolved=true
-# ─────────────────────────────────────────────
-#
-# COSA FA:
-#   Chiama process-faq-batch in loop con limit=50, finché non raggiunge
-#   il target di chat processate (o esaurisce le pending).
-#
-# QUANDO LANCIARLO:
-#   - Manuale dal tab "Actions" → "Backfill FAQ" → "Run workflow"
-#
-# COSTI ATTESI:
-#   ~$0.0009 per chat (Claude Haiku batch + OpenAI embedding)
-#   500 chat = ~$0.50
-#   9.246 chat (totale) = ~$8.50
-#
-# ─────────────────────────────────────────────
+# Backfill FAQ — auto-stop friendly, riprendibile
+# Stop dopo 5h per evitare kill GitHub Actions a 6h.
 
 name: Backfill FAQ
 
@@ -23,22 +9,30 @@ on:
   workflow_dispatch:
     inputs:
       target_total:
-        description: "Numero totale chat da processare (es. 500)"
+        description: "Numero totale chat da processare (es. 10000)"
+        required: false
+        default: "10000"
+      limit_per_call:
+        description: "Chat per chiamata (raccomandato 25)"
         required: false
         default: "25"
-      limit_per_call:
-        description: "Chat per chiamata (max 200, raccomandato 25 per sicurezza)"
-        required: false
-        default: "50"
       max_iterations:
-        description: "Numero max chiamate (safety, default 30)"
+        description: "Numero max chiamate (default 400)"
         required: false
-        default: "30"
+        default: "400"
+      max_runtime_minutes:
+        description: "Auto-stop dopo N minuti (default 300 = 5h)"
+        required: false
+        default: "300"
+      max_error_pct:
+        description: "Stop se error rate >= X% (default 20)"
+        required: false
+        default: "20"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 350
 
     steps:
       - name: Backfill loop
@@ -48,30 +42,43 @@ jobs:
           TARGET_TOTAL: ${{ inputs.target_total }}
           LIMIT_PER_CALL: ${{ inputs.limit_per_call }}
           MAX_ITERATIONS: ${{ inputs.max_iterations }}
+          MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes }}
+          MAX_ERROR_PCT: ${{ inputs.max_error_pct }}
         run: |
           echo "═══════════════════════════════════════"
           echo "  BACKFILL FAQ"
           echo "═══════════════════════════════════════"
-          echo "Target totale:    $TARGET_TOTAL chat"
-          echo "Limit per call:   $LIMIT_PER_CALL"
-          echo "Max iterations:   $MAX_ITERATIONS"
-          echo "Started at:       $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "Target totale:        $TARGET_TOTAL chat"
+          echo "Limit per call:       $LIMIT_PER_CALL"
+          echo "Max iterations:       $MAX_ITERATIONS"
+          echo "Max runtime:          ${MAX_RUNTIME_MINUTES}m"
+          echo "Max error rate:       ${MAX_ERROR_PCT}%"
+          echo "Started at:           $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo ""
 
           TOTAL_PROCESSED=0
-          TOTAL_CANDIDATES=0
           TOTAL_TOKENS_CLAUDE=0
           TOTAL_TOKENS_OPENAI=0
           TOTAL_ERRORS=0
           ITERATIONS=0
           START_TS=$(date +%s)
+          MAX_RUNTIME_SECONDS=$(( MAX_RUNTIME_MINUTES * 60 ))
+          STOP_REASON=""
 
           while [ $ITERATIONS -lt $MAX_ITERATIONS ] && [ $TOTAL_PROCESSED -lt $TARGET_TOTAL ]; do
+            ELAPSED=$(( $(date +%s) - START_TS ))
+            if [ $ELAPSED -ge $MAX_RUNTIME_SECONDS ]; then
+              STOP_REASON="MAX_RUNTIME ($(($ELAPSED / 60))min)"
+              echo ""
+              echo "⏱️  Auto-stop: $STOP_REASON"
+              break
+            fi
+
             ITERATIONS=$((ITERATIONS + 1))
             ITER_START=$(date +%s)
 
             echo "──────────────────────────────────────"
-            echo "▶ Iterazione $ITERATIONS / $MAX_ITERATIONS — processati finora: $TOTAL_PROCESSED / $TARGET_TOTAL"
+            echo "▶ Iter $ITERATIONS/$MAX_ITERATIONS | processati: $TOTAL_PROCESSED/$TARGET_TOTAL | runtime: $(($ELAPSED / 60))m"
 
             HTTP_CODE=$(curl --silent --show-error \
               --max-time 600 \
@@ -89,11 +96,15 @@ jobs:
               echo "❌ HTTP $HTTP_CODE — Response:"
               cat /tmp/faq_response.json
               echo ""
-              echo "Stop loop per errore."
-              exit 1
+              if [ "$HTTP_CODE" = "546" ] || [ "$HTTP_CODE" = "504" ] || [ "$HTTP_CODE" = "503" ]; then
+                echo "⏸️  Errore temporaneo: aspetto 30s e ritento..."
+                sleep 30
+                continue
+              fi
+              STOP_REASON="HTTP_ERROR $HTTP_CODE"
+              break
             fi
 
-            OK=$(jq -r '.ok' /tmp/faq_response.json)
             CANDIDATES=$(jq -r '.stats.candidates // 0' /tmp/faq_response.json)
             PROCESSED=$(jq -r '.stats.processed // 0' /tmp/faq_response.json)
             TOKENS_C=$(jq -r '.stats.tokens_claude // 0' /tmp/faq_response.json)
@@ -102,38 +113,46 @@ jobs:
             MESSAGE=$(jq -r '.message // ""' /tmp/faq_response.json)
 
             TOTAL_PROCESSED=$((TOTAL_PROCESSED + PROCESSED))
-            TOTAL_CANDIDATES=$((TOTAL_CANDIDATES + CANDIDATES))
             TOTAL_TOKENS_CLAUDE=$((TOTAL_TOKENS_CLAUDE + TOKENS_C))
             TOTAL_TOKENS_OPENAI=$((TOTAL_TOKENS_OPENAI + TOKENS_O))
             TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
 
-            echo "   ↳ ok: $OK | $MESSAGE"
-            echo "   ↳ candidati: $CANDIDATES | processed: $PROCESSED | errors: $ERRORS | tempo: ${ITER_ELAPSED}s"
-            echo "   ↳ TOTALI: chat=$TOTAL_PROCESSED, tokens_claude=$TOTAL_TOKENS_CLAUDE, tokens_openai=$TOTAL_TOKENS_OPENAI"
+            echo "   ↳ $MESSAGE"
+            echo "   ↳ cand: $CANDIDATES | proc: $PROCESSED | err: $ERRORS | t: ${ITER_ELAPSED}s"
+            echo "   ↳ TOT: chat=$TOTAL_PROCESSED, tok_c=$TOTAL_TOKENS_CLAUDE, tok_o=$TOTAL_TOKENS_OPENAI, err=$TOTAL_ERRORS"
 
-            # Stop se non ci sono più candidati
             if [ "$CANDIDATES" -eq 0 ]; then
+              STOP_REASON="COMPLETE (no more pending)"
               echo ""
               echo "🎉 Nessuna chat pending. Backfill completato!"
               break
             fi
 
-            # Stop se ha processato 0 ma c'erano candidati (potrebbe esserci un blocco)
             if [ "$PROCESSED" -eq 0 ] && [ "$CANDIDATES" -gt 0 ]; then
+              STOP_REASON="ALL_FAILED (candidates but 0 processed)"
               echo ""
-              echo "⚠️  $CANDIDATES candidati ma 0 processati. Probabile errore — stop."
+              echo "⚠️  $CANDIDATES candidati ma 0 processati — stop."
               break
             fi
 
-            # Pausa gentile prima del prossimo round
+            if [ $TOTAL_PROCESSED -ge 50 ]; then
+              ERROR_PCT=$(( TOTAL_ERRORS * 100 / (TOTAL_PROCESSED + TOTAL_ERRORS) ))
+              if [ $ERROR_PCT -ge $MAX_ERROR_PCT ]; then
+                STOP_REASON="HIGH_ERROR_RATE (${ERROR_PCT}%)"
+                echo ""
+                echo "⚠️  Error rate alto: ${ERROR_PCT}% — stop."
+                break
+              fi
+            fi
+
             sleep 10
           done
 
+          if [ -z "$STOP_REASON" ]; then
+            STOP_REASON="LIMIT_REACHED"
+          fi
+
           TOTAL_ELAPSED=$(( $(date +%s) - START_TS ))
-          
-          # Costo stimato:
-          # Haiku 4.5: $1/1M input + $5/1M output (approx 80% input, 20% output)
-          # OpenAI text-embedding-3-small: $0.02/1M token
           CLAUDE_COST=$(echo "scale=4; ($TOTAL_TOKENS_CLAUDE * 0.8 * 1.0 + $TOTAL_TOKENS_CLAUDE * 0.2 * 5.0) / 1000000" | bc 2>/dev/null || echo "0")
           OPENAI_COST=$(echo "scale=4; $TOTAL_TOKENS_OPENAI * 0.02 / 1000000" | bc 2>/dev/null || echo "0")
 
@@ -141,6 +160,7 @@ jobs:
           echo "═══════════════════════════════════════"
           echo "  RIEPILOGO BACKFILL FAQ"
           echo "═══════════════════════════════════════"
+          echo "Stop reason:          $STOP_REASON"
           echo "Iterazioni:           $ITERATIONS"
           echo "Chat processate:      $TOTAL_PROCESSED"
           echo "Errori:               $TOTAL_ERRORS"
@@ -150,3 +170,8 @@ jobs:
           echo "Costo OpenAI (stim):  \$$OPENAI_COST"
           echo "Tempo totale:         ${TOTAL_ELAPSED}s ($(($TOTAL_ELAPSED / 60))m $(($TOTAL_ELAPSED % 60))s)"
           echo "Finished at:          $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          
+          if [[ "$STOP_REASON" == *"MAX_RUNTIME"* ]] || [[ "$STOP_REASON" == *"LIMIT_REACHED"* ]]; then
+            echo "💡 SUGGERIMENTO: rilancia questo workflow per continuare dal punto attuale."
+          fi

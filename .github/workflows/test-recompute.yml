@@ -1,0 +1,19 @@
+name: Test Recompute
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call run-recompute-all
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          curl --silent --max-time 180 \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            "$SUPABASE_URL/functions/v1/run-recompute-all" | jq .

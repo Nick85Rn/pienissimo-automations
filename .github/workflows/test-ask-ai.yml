@@ -1,0 +1,33 @@
+name: Test Ask AI
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Domanda da testare"
+        required: true
+        default: "Come creo una promo su un solo giorno?"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call ask-ai
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          QUERY: ${{ inputs.query }}
+        run: |
+          echo "▶ Asking: $QUERY"
+          echo "═══════════════════════════════════════"
+          
+          curl --silent --no-buffer \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\":\"$QUERY\"}" \
+            "$SUPABASE_URL/functions/v1/ask-ai"
+          
+          echo ""
+          echo "═══════════════════════════════════════"

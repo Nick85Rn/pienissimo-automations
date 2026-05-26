@@ -39,7 +39,7 @@ jobs:
             -X POST \
             -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
             -H "apikey: $SUPABASE_ANON_KEY" \
-            "$SUPABASE_URL/functions/v1/export-knowledge-base-md$QS"
+            "$SUPABASE_URL/functions/v1/export-knowledge-base$QS"
           
           echo "═══════════════════════════════════════"
           echo "Response headers:"

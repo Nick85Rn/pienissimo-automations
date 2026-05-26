@@ -1,0 +1,62 @@
+name: Test Export KB
+
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Filtra categoria (vuoto = tutte)"
+        required: false
+        default: ""
+      max_per_category:
+        description: "Max casi per categoria (vuoto = tutti)"
+        required: false
+        default: ""
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call export-knowledge-base-md
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          CATEGORY: ${{ inputs.category }}
+          MAX_PER_CATEGORY: ${{ inputs.max_per_category }}
+        run: |
+          QS=""
+          if [ -n "$CATEGORY" ]; then QS="?category=$CATEGORY"; fi
+          if [ -n "$MAX_PER_CATEGORY" ]; then
+            if [ -z "$QS" ]; then QS="?max_per_category=$MAX_PER_CATEGORY"
+            else QS="$QS&max_per_category=$MAX_PER_CATEGORY"; fi
+          fi
+          
+          echo "▶ Calling export-knowledge-base-md$QS"
+          
+          curl --silent --show-error \
+            --max-time 120 \
+            -D /tmp/headers.txt \
+            -o /tmp/knowledge.md \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            "$SUPABASE_URL/functions/v1/export-knowledge-base-md$QS"
+          
+          echo "═══════════════════════════════════════"
+          echo "Response headers:"
+          grep -iE "^(content-type|content-disposition|x-)" /tmp/headers.txt
+          echo ""
+          echo "File size: $(ls -lh /tmp/knowledge.md | awk '{print $5}')"
+          echo "Lines: $(wc -l < /tmp/knowledge.md)"
+          echo ""
+          echo "First 30 lines:"
+          head -30 /tmp/knowledge.md
+          echo ""
+          echo "Last 5 lines:"
+          tail -5 /tmp/knowledge.md
+      
+      - name: Upload markdown
+        uses: actions/upload-artifact@v4
+        with:
+          name: pienissimo-knowledge-base
+          path: /tmp/knowledge.md
+          retention-days: 7

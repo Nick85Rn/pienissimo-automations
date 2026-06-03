@@ -1,37 +1,123 @@
-name: Export KB ElevenLabs
+import fs from 'fs';
+import path from 'path';
 
-on:
-  workflow_dispatch:
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-jobs:
-  export-kb:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+const CATEGORIES = [
+  'WhatsApp',
+  'Prenotazioni',
+  'Marketing',
+  'Fidelity',
+  'Backoffice',
+  'App',
+  'Menu',
+  'AI/Integrazioni',
+  'Centralino'
+];
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+async function fetchFAQ(category) {
+  let allRows = [];
+  let offset = 0;
+  const pageSize = 1000;
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+  while (true) {
+    const encodedCategory = encodeURIComponent(category);
+    const url = `${SUPABASE_URL}/rest/v1/chat_faq?select=qa_title,qa_summary,subcategory&category=eq.${encodedCategory}&qa_title=not.is.null&qa_summary=not.is.null&order=subcategory.asc,qa_title.asc&offset=${offset}&limit=${pageSize}`;
 
-      - name: Install dependencies
-        run: |
-          npm init -y > /dev/null
-          npm pkg set type=module
-          npm install --silent
+    const res = await fetch(url, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        Accept: 'application/json',
+      }
+    });
 
-      - name: Run export KB
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: node scripts/export-kb-elevenlabs.js
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Supabase error ${res.status}: ${text}`);
+    }
 
-      - name: Upload KB files as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: kb-elevenlabs-${{ github.run_number }}
-          path: kb_output/
-          retention-days: 7
+    const data = await res.json();
+    if (!data || data.length === 0) break;
+    allRows = allRows.concat(data);
+    if (data.length < pageSize) break;
+    offset += pageSize;
+  }
+
+  return allRows;
+}
+
+function generateMD(category, faqs) {
+  let md = `# Pienissimo PRO — Knowledge Base: ${category}\n\n`;
+  md += `> Documento generato il ${new Date().toLocaleDateString('it-IT')} — ${faqs.length} domande frequenti\n\n`;
+  md += `---\n\n`;
+
+  const grouped = {};
+  for (const faq of faqs) {
+    const sub = faq.subcategory || 'Generale';
+    if (!grouped[sub]) grouped[sub] = [];
+    grouped[sub].push(faq);
+  }
+
+  for (const [sub, items] of Object.entries(grouped)) {
+    md += `## ${sub}\n\n`;
+    for (const item of items) {
+      md += `**D: ${item.qa_title.trim()}**\n`;
+      md += `R: ${item.qa_summary.trim()}\n\n`;
+    }
+  }
+
+  return md;
+}
+
+async function main() {
+  const outDir = './kb_output';
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+  console.log('==========================================');
+  console.log('Export KB Pienissimo PRO per ElevenLabs');
+  console.log(`Data: ${new Date().toISOString()}`);
+  console.log('==========================================\n');
+
+  const summary = [];
+
+  for (const category of CATEGORIES) {
+    process.stdout.write(`Esporto "${category}"... `);
+    try {
+      const faqs = await fetchFAQ(category);
+      const md = generateMD(category, faqs);
+      const filename = `KB_${category.replace('/', '-').replace(/ /g, '_')}.md`;
+      const filepath = path.join(outDir, filename);
+      fs.writeFileSync(filepath, md, 'utf8');
+      const sizeKB = Math.round(fs.statSync(filepath).size / 1024);
+      console.log(`✅ ${faqs.length} FAQ — ${filename} (${sizeKB} KB)`);
+      summary.push({ category, faqs: faqs.length, file: filename, sizeKB });
+    } catch (err) {
+      console.log(`❌ ERRORE: ${err.message}`);
+      summary.push({ category, error: err.message });
+    }
+  }
+
+  console.log('\n==========================================');
+  console.log('RIEPILOGO FINALE');
+  console.log('==========================================');
+  let totalFAQ = 0;
+  for (const s of summary) {
+    if (s.error) {
+      console.log(`  ❌ ${s.category}: ${s.error}`);
+    } else {
+      console.log(`  ✅ ${s.category}: ${s.faqs} FAQ — ${s.sizeKB} KB`);
+      totalFAQ += s.faqs;
+    }
+  }
+  console.log(`\nTotale FAQ esportate: ${totalFAQ}`);
+
+  const hasErrors = summary.some(s => s.error);
+  process.exit(hasErrors ? 1 : 0);
+}
+
+main().catch(err => {
+  console.error('ERRORE FATALE:', err);
+  process.exit(1);
+});

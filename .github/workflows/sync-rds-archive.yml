@@ -23,7 +23,7 @@ jobs:
         run: |
           npm init -y > /dev/null
           npm pkg set type=module
-          npm install --silent pg @supabase/supabase-js
+          npm install --silent pg
 
       - name: Run sync Supabase to RDS
         env:

@@ -1,8 +1,7 @@
 // Sync Supabase → RDS Archive
-// Strategia: upsert idempotente, basato su modified_time/created_time
-// Esegue le 4 tabelle Zoho in sequenza, log finale con totali
+// Strategia: upsert idempotente basato su modified_time/created_time
+// Usa fetch nativo Node 20 per evitare problemi di WebSocket con @supabase/supabase-js
 
-import { createClient } from '@supabase/supabase-js';
 import pg from 'pg';
 
 const { Client } = pg;
@@ -12,7 +11,7 @@ const TABLES = [
   {
     name: 'zoho_raw_chats',
     pk: 'chat_id',
-    timestampCol: 'created_time', // usiamo created_time perché non c'è modified_time
+    timestampCol: 'created_time',
     columns: [
       'chat_id', 'visitor_name', 'operator', 'department',
       'created_time', 'closed_time', 'waiting_time_seconds',
@@ -61,13 +60,16 @@ const TABLES = [
 ];
 
 const BATCH_SIZE = 500;
+const PAGE_SIZE = 1000;
 
 // ============ CONNESSIONI ============
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
-);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('❌ Mancano SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY');
+  process.exit(1);
+}
 
 const rds = new Client({
   host: process.env.RDS_HOST,
@@ -79,38 +81,57 @@ const rds = new Client({
   connectionTimeoutMillis: 30000,
 });
 
+// ============ SUPABASE REST API ============
+async function supabaseSelect(tableName, columns, filterCol, filterValue, offset, limit) {
+  const select = encodeURIComponent(columns.join(','));
+  let url = `${SUPABASE_URL}/rest/v1/${tableName}?select=${select}&order=${filterCol}.asc&offset=${offset}&limit=${limit}`;
+
+  if (filterValue) {
+    url += `&${filterCol}=gt.${encodeURIComponent(filterValue)}`;
+  }
+
+  const res = await fetch(url, {
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Accept': 'application/json',
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase REST error ${res.status}: ${text}`);
+  }
+
+  return res.json();
+}
+
 // ============ HELPERS ============
 async function getLastTimestampOnRDS(tableName, timestampCol) {
   const result = await rds.query(
     `SELECT MAX(${timestampCol}) AS last_ts FROM public.${tableName}`
   );
-  return result.rows[0].last_ts; // null se tabella vuota
+  return result.rows[0].last_ts;
 }
 
 async function fetchFromSupabase(table, sinceTimestamp) {
-  // Paginato per evitare timeout / memory issues
   let allRows = [];
-  let from = 0;
-  const pageSize = 1000;
+  let offset = 0;
 
   while (true) {
-    let query = supabase
-      .from(table.name)
-      .select(table.columns.join(','))
-      .order(table.timestampCol, { ascending: true })
-      .range(from, from + pageSize - 1);
+    const data = await supabaseSelect(
+      table.name,
+      table.columns,
+      table.timestampCol,
+      sinceTimestamp ? sinceTimestamp.toISOString() : null,
+      offset,
+      PAGE_SIZE
+    );
 
-    if (sinceTimestamp) {
-      query = query.gt(table.timestampCol, sinceTimestamp);
-    }
-
-    const { data, error } = await query;
-    if (error) throw new Error(`Supabase fetch error: ${error.message}`);
     if (!data || data.length === 0) break;
-
     allRows = allRows.concat(data);
-    if (data.length < pageSize) break;
-    from += pageSize;
+    if (data.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
   }
 
   return allRows;
@@ -125,7 +146,6 @@ function buildUpsertQuery(table, rows) {
   for (const row of rows) {
     const rowPlaceholders = cols.map(c => {
       const val = row[c];
-      // JSONB columns: stringify se è oggetto
       if (table.jsonbCols.includes(c) && val !== null && typeof val === 'object') {
         values.push(JSON.stringify(val));
       } else {
@@ -176,7 +196,8 @@ async function syncTable(table) {
     const batch = rows.slice(i, i + BATCH_SIZE);
     const count = await upsertBatch(table, batch);
     totalSynced += count;
-    console.log(`  Batch ${i / BATCH_SIZE + 1}: ${count} righe upsertate (totale: ${totalSynced}/${rows.length})`);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    console.log(`  Batch ${batchNum}: ${count} righe upsertate (totale: ${totalSynced}/${rows.length})`);
   }
 
   console.log(`  ✅ ${table.name}: ${totalSynced} righe sincronizzate`);

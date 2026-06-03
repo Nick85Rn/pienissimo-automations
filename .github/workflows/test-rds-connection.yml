@@ -1,0 +1,36 @@
+name: Test RDS Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-rds:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mostra IP del runner GitHub
+        run: |
+          echo "=========================================="
+          echo "IP pubblico del runner GitHub Actions:"
+          curl -s https://api.ipify.org
+          echo ""
+          echo "=========================================="
+
+      - name: Installa psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Test connessione RDS
+        env:
+          PGPASSWORD: ${{ secrets.RDS_PASSWORD }}
+        run: |
+          echo "Tentativo di connessione a RDS..."
+          psql \
+            -h pienissimo-assistenza.cqgivz5cj8fm.eu-central-1.rds.amazonaws.com \
+            -p 5432 \
+            -U ${{ secrets.RDS_USER }} \
+            -d pienissimo_archivio \
+            -c "SELECT current_database() AS db, current_user AS utente, now() AS ora_server, version() AS versione;" \
+            --set=ON_ERROR_STOP=1
+          echo ""
+          echo "✅ Connessione riuscita!"

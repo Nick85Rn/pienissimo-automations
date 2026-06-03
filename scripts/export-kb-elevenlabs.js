@@ -1,0 +1,37 @@
+name: Export KB ElevenLabs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export-kb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y > /dev/null
+          npm pkg set type=module
+          npm install --silent
+
+      - name: Run export KB
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/export-kb-elevenlabs.js
+
+      - name: Upload KB files as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-elevenlabs-${{ github.run_number }}
+          path: kb_output/
+          retention-days: 7

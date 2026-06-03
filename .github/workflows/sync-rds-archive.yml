@@ -2,8 +2,6 @@ name: Sync Supabase → RDS Archive
 
 on:
   schedule:
-    # Ogni notte alle 05:30 UTC = 06:30/07:30 ora italiana
-    # Dopo il daily-chat-sync che gira alle 05:00 UTC
     - cron: '30 5 * * *'
   workflow_dispatch:
 
@@ -21,13 +19,13 @@ jobs:
         with:
           node-version: '20'
 
-- name: Install dependencies
+      - name: Install dependencies
         run: |
           npm init -y > /dev/null
           npm pkg set type=module
           npm install --silent pg @supabase/supabase-js
 
-      - name: Run sync Supabase → RDS
+      - name: Run sync Supabase to RDS
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

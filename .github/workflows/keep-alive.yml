@@ -1,0 +1,48 @@
+name: Keep Repository Alive
+
+# Scopo: GitHub disattiva automaticamente i workflow schedulati (cron)
+# se il repository non riceve attività (push/commit) per 60+ giorni.
+# Questo workflow fa un piccolo commit innocuo una volta al mese,
+# aggiornando solo un timestamp in KEEPALIVE.md — sufficiente a
+# mantenere il repo "attivo" agli occhi di GitHub, senza toccare
+# nessun file funzionale degli altri workflow.
+#
+# Se anche QUESTO workflow venisse mai disabilitato per lo stesso
+# motivo, va riattivato manualmente da Actions → Keep Repository Alive
+# → Enable workflow (a quel punto significherebbe che il repo è
+# rimasto inattivo per un periodo ancora più lungo, es. dopo una
+# lunga pausa di manutenzione).
+
+on:
+  schedule:
+    # Il giorno 1 di ogni mese alle 06:00 UTC — ampio margine di
+    # sicurezza rispetto al limite dei 60 giorni di GitHub.
+    - cron: "0 6 1 * *"
+  workflow_dispatch: {} # permette anche un run manuale da Actions
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Aggiorna timestamp keep-alive
+        run: |
+          mkdir -p .github
+          echo "Ultimo keep-alive automatico: $(date -u '+%Y-%m-%d %H:%M UTC')" > .github/KEEPALIVE.md
+          echo "" >> .github/KEEPALIVE.md
+          echo "Questo file viene aggiornato automaticamente una volta al mese" >> .github/KEEPALIVE.md
+          echo "per evitare che GitHub disattivi i workflow schedulati del repository" >> .github/KEEPALIVE.md
+          echo "per inattività (limite: 60 giorni senza commit)." >> .github/KEEPALIVE.md
+
+      - name: Commit e push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/KEEPALIVE.md
+          git diff --staged --quiet && echo "Nessuna modifica da committare" || git commit -m "chore: keep-alive automatico"
+          git push

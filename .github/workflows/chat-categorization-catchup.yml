@@ -1,0 +1,65 @@
+# Scopo: smaltire l'arretrato di chat non ancora categorizzate,
+# lanciando llm-categorize-chats ripetutamente finché non ne restano
+# più (o finché non si raggiunge il numero massimo di batch previsto
+# per questa esecuzione).
+#
+# A differenza di "Daily Chat Sync" (che fa 3 batch fissi ogni giorno,
+# ~300 chat/giorno), questo workflow è pensato per un uso MANUALE e
+# occasionale, quando serve smaltire un arretrato accumulato più
+# velocemente del ritmo quotidiano — es. dopo un'interruzione del
+# servizio come questa.
+#
+# Non è schedulato: va lanciato a mano da Actions → Chat Categorization
+# Catch-up → Run workflow, quando serve.
+
+name: Chat Categorization Catch-up
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_batches:
+        description: "Numero massimo di batch da 100 chat da processare in questa esecuzione (ogni batch impiega ~1-2 minuti)"
+        required: false
+        default: "20"
+
+jobs:
+  catchup:
+    runs-on: ubuntu-latest
+    # 20 batch x ~2 min + pause = margine ampio entro il limite di 6h di GitHub Actions
+    timeout-minutes: 90
+
+    steps:
+      - name: Smaltisci arretrato categorizzazione
+        run: |
+          MAX_BATCHES="${{ github.event.inputs.max_batches }}"
+          echo "Eseguo fino a $MAX_BATCHES batch da 100 chat ciascuno..."
+
+          for i in $(seq 1 "$MAX_BATCHES"); do
+            echo ""
+            echo "=== Batch $i di $MAX_BATCHES ==="
+
+            RESPONSE=$(curl -sS -X POST \
+              "${{ secrets.SUPABASE_URL }}/functions/v1/llm-categorize-chats?limit=100&since_year=2026" \
+              -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+              -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+              -H "Content-Type: application/json")
+
+            echo "$RESPONSE"
+
+            # Se la funzione segnala che non c'è più nulla da processare
+            # ("done": true, tipico messaggio "Nessuna chat da processare"),
+            # ci fermiamo qui invece di continuare a chiamarla a vuoto.
+            if echo "$RESPONSE" | grep -q '"done"[[:space:]]*:[[:space:]]*true'; then
+              echo ""
+              echo "✅ Arretrato smaltito completamente dopo $i batch — interrompo il ciclo."
+              exit 0
+            fi
+
+            # Pausa tra un batch e l'altro per non sovraccaricare le API
+            # Zoho/Anthropic con chiamate troppo ravvicinate.
+            sleep 20
+          done
+
+          echo ""
+          echo "Raggiunto il limite di $MAX_BATCHES batch per questa esecuzione."
+          echo "Se restano ancora chat da categorizzare, rilancia il workflow."

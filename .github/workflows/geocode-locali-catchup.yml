@@ -1,0 +1,73 @@
+# Scopo: smaltire l'arretrato di locali senza coordinate geografiche,
+# lanciando geocode-locali ripetutamente finché non ne restano più (o
+# finché non si raggiunge il numero massimo di batch previsto per
+# questa esecuzione).
+#
+# Ogni chiamata a geocode-locali processa fino a 90 locali con 1.1s di
+# pausa tra una richiesta e l'altra (limite Nominatim: 1 richiesta al
+# secondo) — quindi ogni batch impiega circa 100 secondi. Non è
+# possibile accelerare oltre questo limite senza passare a un
+# provider di geocoding a pagamento: è una policy di utilizzo di
+# Nominatim/OpenStreetMap, non un parametro configurabile lato nostro.
+#
+# I clienti DISDETTO sono già esclusi direttamente dalla funzione
+# geocode-locali (vedi codice della funzione): questo workflow smaltisce
+# quindi solo i locali che contano davvero per la mappa installazioni.
+#
+# Non è schedulato: va lanciato a mano da Actions → Geocode Locali
+# Catch-up → Run workflow, quando serve.
+
+name: Geocode Locali Catch-up
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_batches:
+        description: "Numero massimo di batch da 90 locali da processare in questa esecuzione (ogni batch impiega ~100s)"
+        required: false
+        default: "25"
+
+jobs:
+  catchup:
+    runs-on: ubuntu-latest
+    # 25 batch x ~110s (100s chiamata + margine) = ~46 min, ampio margine
+    # entro il limite di 6h di GitHub Actions
+    timeout-minutes: 90
+
+    steps:
+      - name: Smaltisci arretrato geocoding
+        run: |
+          MAX_BATCHES="${{ github.event.inputs.max_batches }}"
+          echo "Eseguo fino a $MAX_BATCHES batch da 90 locali ciascuno (~100s/batch)..."
+
+          for i in $(seq 1 "$MAX_BATCHES"); do
+            echo ""
+            echo "=== Batch $i di $MAX_BATCHES ==="
+
+            RESPONSE=$(curl -sS -X POST \
+              "${{ secrets.SUPABASE_URL }}/functions/v1/geocode-locali?limit=90" \
+              -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+              -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+              -H "Content-Type: application/json")
+
+            echo "$RESPONSE"
+
+            # Quando la coda è esaurita, la funzione processa meno record
+            # del limite richiesto (processed < 90) — segno che non ci
+            # sono più candidati e possiamo fermarci.
+            PROCESSED=$(echo "$RESPONSE" | grep -o '"processed"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+
+            if [ -n "$PROCESSED" ] && [ "$PROCESSED" -lt 90 ]; then
+              echo ""
+              echo "✅ Coda esaurita (processati $PROCESSED su 90 attesi) dopo $i batch — interrompo il ciclo."
+              exit 0
+            fi
+
+            # Pausa breve tra un batch e l'altro, oltre al rate limit
+            # già rispettato internamente dalla funzione stessa.
+            sleep 5
+          done
+
+          echo ""
+          echo "Raggiunto il limite di $MAX_BATCHES batch per questa esecuzione."
+          echo "Se restano ancora locali da geocodificare, rilancia il workflow."

@@ -1,73 +1,167 @@
-# Scopo: smaltire l'arretrato di locali senza coordinate geografiche,
-# lanciando geocode-locali ripetutamente finché non ne restano più (o
-# finché non si raggiunge il numero massimo di batch previsto per
-# questa esecuzione).
-#
-# Ogni chiamata a geocode-locali processa fino a 90 locali con 1.1s di
-# pausa tra una richiesta e l'altra (limite Nominatim: 1 richiesta al
-# secondo) — quindi ogni batch impiega circa 100 secondi. Non è
-# possibile accelerare oltre questo limite senza passare a un
-# provider di geocoding a pagamento: è una policy di utilizzo di
-# Nominatim/OpenStreetMap, non un parametro configurabile lato nostro.
-#
-# I clienti DISDETTO sono già esclusi direttamente dalla funzione
-# geocode-locali (vedi codice della funzione): questo workflow smaltisce
-# quindi solo i locali che contano davvero per la mappa installazioni.
-#
-# Non è schedulato: va lanciato a mano da Actions → Geocode Locali
-# Catch-up → Run workflow, quando serve.
+// supabase/functions/geocode-locali/index.ts
+//
+// Geocodifica in background gli indirizzi dei locali (testo -> lat/lng) usando
+// Nominatim (OpenStreetMap). Sostituisce il GeocodingTool lato browser come
+// meccanismo primario: gira come Edge Function schedulata, quindi non serve
+// tenere una scheda aperta, e cattura automaticamente i nuovi locali (basta
+// che abbiano un indirizzo e non ancora coordinate).
+//
+// Nominatim impone max 1 richiesta/secondo (Usage Policy) — rispettato
+// rigorosamente qui, non è aggirabile senza cambiare provider a pagamento.
+//
+// FIX: i clienti DISDETTO sono esclusi dai candidati alla geocodifica.
+// Sono per lo più record storici senza indirizzo affidabile e, quando ce
+// l'hanno, non hanno più priorità operativa — geocodificarli sprecherebbe
+// la risorsa più scarsa del processo (1 richiesta/secondo Nominatim) a
+// scapito dei locali attivi/parziali/nuovi che contano davvero per la
+// mappa installazioni.
+//
+// Modalita':
+//   ?limit=90   -> numero massimo di record da processare in questa esecuzione
+//                  (default 90, ~100s di esecuzione con ~1.1s tra le richieste)
+//                  Tenuto volutamente sotto i limiti di durata delle Edge Function.
 
-name: Geocode Locali Catch-up
+import { createClient } from "npm:@supabase/supabase-js@2";
 
-on:
-  workflow_dispatch:
-    inputs:
-      max_batches:
-        description: "Numero massimo di batch da 90 locali da processare in questa esecuzione (ogni batch impiega ~100s)"
-        required: false
-        default: "25"
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+};
 
-jobs:
-  catchup:
-    runs-on: ubuntu-latest
-    # 25 batch x ~110s (100s chiamata + margine) = ~46 min, ampio margine
-    # entro il limite di 6h di GitHub Actions
-    timeout-minutes: 90
+function supa() {
+  return createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { autoRefreshToken: false, persistSession: false } },
+  );
+}
 
-    steps:
-      - name: Smaltisci arretrato geocoding
-        run: |
-          MAX_BATCHES="${{ github.event.inputs.max_batches }}"
-          echo "Eseguo fino a $MAX_BATCHES batch da 90 locali ciascuno (~100s/batch)..."
+const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
+const USER_AGENT = "PienissimoMappaInstallazioni/1.0";
+const DELAY_MS = 1100; // poco sopra 1 richiesta/secondo, margine sulla policy Nominatim
+const MAX_LIMIT = 150;
 
-          for i in $(seq 1 "$MAX_BATCHES"); do
-            echo ""
-            echo "=== Batch $i di $MAX_BATCHES ==="
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-            RESPONSE=$(curl -sS -X POST \
-              "${{ secrets.SUPABASE_URL }}/functions/v1/geocode-locali?limit=90" \
-              -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
-              -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
-              -H "Content-Type: application/json")
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
 
-            echo "$RESPONSE"
+  const sb = supa();
+  const url = new URL(req.url);
+  const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "90") || 90, MAX_LIMIT);
 
-            # Quando la coda è esaurita, la funzione processa meno record
-            # del limite richiesto (processed < 90) — segno che non ci
-            # sono più candidati e possiamo fermarci.
-            PROCESSED=$(echo "$RESPONSE" | grep -o '"processed"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+  const startedAt = new Date().toISOString();
+  const { data: logRow } = await sb
+    .from("zoho_sync_log")
+    .insert({ source: "geocode_locali", status: "running" })
+    .select()
+    .single();
 
-            if [ -n "$PROCESSED" ] && [ "$PROCESSED" -lt 90 ]; then
-              echo ""
-              echo "✅ Coda esaurita (processati $PROCESSED su 90 attesi) dopo $i batch — interrompo il ciclo."
-              exit 0
-            fi
+  let processed = 0;
+  let found = 0;
+  let httpErrors = 0;         // risposte non-200 da Nominatim (es. 403/429 = bloccato)
+  let zeroResults = 0;        // richiesta riuscita ma nessun indirizzo corrispondente
+  let networkErrors = 0;      // fetch fallita del tutto (timeout, DNS, ecc.)
+  const sampleErrors: string[] = []; // primi errori/risposte grezze, per diagnosi
 
-            # Pausa breve tra un batch e l'altro, oltre al rate limit
-            # già rispettato internamente dalla funzione stessa.
-            sleep 5
-          done
+  try {
+    // Candidati: hanno un indirizzo testuale ma non ancora coordinate,
+    // ESCLUSI i clienti disdetti (vedi nota in cima al file).
+    // Nessun filtro sulla data: cosi' riprende sempre da dove si era fermato
+    // e cattura anche i locali aggiunti/aggiornati di recente.
+    const { data: candidates, error } = await sb
+      .from("zoho_raw_locali")
+      .select("zoho_locale_id, indirizzo, citta, provincia")
+      .not("indirizzo", "is", null)
+      .is("lat", null)
+      .neq("stato_cliente", "DISDETTO")
+      .order("zoho_locale_id")
+      .limit(limit);
+    if (error) throw new Error(`Errore lettura candidati: ${error.message}`);
 
-          echo ""
-          echo "Raggiunto il limite di $MAX_BATCHES batch per questa esecuzione."
-          echo "Se restano ancora locali da geocodificare, rilancia il workflow."
+    for (const row of candidates ?? []) {
+      processed++;
+      const query = [row.indirizzo, row.citta, row.provincia].filter(Boolean).join(", ");
+      try {
+        const params = new URLSearchParams({
+          format: "json",
+          q: query,
+          addressdetails: "1",
+          limit: "1",
+        });
+        const res = await fetch(`${NOMINATIM_URL}?${params}`, {
+          headers: { "User-Agent": USER_AGENT },
+        });
+
+        if (!res.ok) {
+          httpErrors++;
+          if (sampleErrors.length < 5) {
+            sampleErrors.push(`HTTP ${res.status} per "${query}"`);
+          }
+          await sleep(DELAY_MS);
+          continue;
+        }
+
+        const results = await res.json();
+
+        if (Array.isArray(results) && results.length > 0) {
+          const { error: updErr } = await sb
+            .from("zoho_raw_locali")
+            .update({ lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon) })
+            .eq("zoho_locale_id", row.zoho_locale_id);
+          if (!updErr) found++;
+        } else {
+          zeroResults++;
+          if (sampleErrors.length < 5) {
+            sampleErrors.push(`Nessun risultato per "${query}"`);
+          }
+        }
+      } catch (e) {
+        networkErrors++;
+        if (sampleErrors.length < 5) {
+          sampleErrors.push(`Errore rete per "${query}": ${(e as Error).message}`);
+        }
+      }
+
+      await sleep(DELAY_MS);
+    }
+
+    if (logRow) {
+      await sb.from("zoho_sync_log").update({
+        status: "success",
+        records_synced: found,
+        finished_at: new Date().toISOString(),
+      }).eq("id", logRow.id);
+    }
+
+    return new Response(JSON.stringify({
+      ok: true,
+      processed,
+      found,
+      http_errors: httpErrors,
+      zero_results: zeroResults,
+      network_errors: networkErrors,
+      sample_errors: sampleErrors,
+      note: processed === limit
+        ? "coda ancora piena, la prossima esecuzione schedulata continuera'"
+        : "coda esaurita per ora (esclusi i clienti disdetti)",
+    }, null, 2), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+
+  } catch (err) {
+    if (logRow) {
+      await sb.from("zoho_sync_log").update({
+        status: "error",
+        error_message: (err as Error).message,
+        finished_at: new Date().toISOString(),
+      }).eq("id", logRow.id);
+    }
+    return new Response(JSON.stringify({ ok: false, error: (err as Error).message }), {
+      status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});

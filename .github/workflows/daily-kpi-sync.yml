@@ -1,0 +1,77 @@
+# .github/workflows/daily-kpi-sync.yml
+#
+# Daily KPI Sync — copre tutte le fonti che oggi si aggiornano SOLO
+# settimanalmente (via Weekly FULL Sync, il lunedì) o solo cliccando
+# manualmente "Aggiorna da Zoho" in dashboard:
+#   - Ticket (5 dipartimenti: Assistenza, Sviluppo, Mail, Zucchetti, WhatsApp)
+#   - SLA ticket
+#   - Sessioni di formazione (+ collegamento azienda per provenienza)
+#   - Contatti (email -> azienda, per il match chat -> provenienza)
+#   - Backlog ticket in tempo reale
+#   - Chat (sync base, idempotente — la parte transcript+AI è già
+#     coperta da Daily Chat Sync alle 05:00 UTC)
+#
+# Tutte le chiamate sono in modalità INCREMENTALE (nessun ?mode=full):
+# veloci, pensate per girare ogni giorno. La riconciliazione completa
+# (ticket fantasma, deep refresh chat) resta compito di Weekly FULL
+# Sync, il lunedì.
+#
+# TRIGGER:
+#   - Automatico: ogni giorno alle 05:10 UTC (10 minuti dopo Daily
+#     Chat Sync, per non sovrapporsi)
+#   - Manuale: Actions → Daily KPI Sync → Run workflow
+
+name: Daily KPI Sync
+
+on:
+  schedule:
+    - cron: "10 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Sync ticket (5 dipartimenti)
+        run: |
+          curl -sS "${{ secrets.SUPABASE_URL }}/functions/v1/zoho-sync-desk" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          echo ""
+
+      - name: Sync SLA ticket
+        run: |
+          curl -sS "${{ secrets.SUPABASE_URL }}/functions/v1/zoho-sync-desk-sla" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          echo ""
+
+      - name: Sync sessioni formazione
+        run: |
+          curl -sS "${{ secrets.SUPABASE_URL }}/functions/v1/zoho-sync-crm" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          echo ""
+
+      - name: Sync contatti (email -> azienda)
+        run: |
+          curl -sS "${{ secrets.SUPABASE_URL }}/functions/v1/zoho-sync-contacts" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          echo ""
+
+      - name: Sync backlog ticket in tempo reale
+        run: |
+          curl -sS "${{ secrets.SUPABASE_URL }}/functions/v1/zoho-sync-open-tickets" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          echo ""
+
+      - name: Sync chat (base, idempotente)
+        run: |
+          curl -sS "${{ secrets.SUPABASE_URL }}/functions/v1/zoho-sync-salesiq" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          echo ""

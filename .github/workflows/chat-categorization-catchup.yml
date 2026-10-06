@@ -21,6 +21,10 @@ on:
         description: "Numero massimo di batch da 100 chat da processare in questa esecuzione (ogni batch impiega ~1-2 minuti)"
         required: false
         default: "20"
+      reclassify:
+        description: "1 = riclassifica anche le chat gia' fatte con la versione precedente (v1). 0 = solo quelle mai categorizzate"
+        required: false
+        default: "0"
 
 jobs:
   catchup:
@@ -32,6 +36,7 @@ jobs:
       - name: Smaltisci arretrato categorizzazione
         run: |
           MAX_BATCHES="${{ github.event.inputs.max_batches }}"
+          RECLASSIFY="${{ github.event.inputs.reclassify }}"
           echo "Eseguo fino a $MAX_BATCHES batch da 100 chat ciascuno..."
 
           for i in $(seq 1 "$MAX_BATCHES"); do
@@ -39,7 +44,7 @@ jobs:
             echo "=== Batch $i di $MAX_BATCHES ==="
 
             RESPONSE=$(curl -sS -X POST \
-              "${{ secrets.SUPABASE_URL }}/functions/v1/llm-categorize-chats?limit=100&since_year=2026" \
+              "${{ secrets.SUPABASE_URL }}/functions/v1/llm-categorize-chats?limit=50&since_year=2026&reclassify=${RECLASSIFY}" \
               -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
               -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
               -H "Content-Type: application/json")
@@ -47,9 +52,10 @@ jobs:
             echo "$RESPONSE"
 
             # Se la funzione segnala che non c'è più nulla da processare
-            # ("done": true, tipico messaggio "Nessuna chat da processare"),
-            # ci fermiamo qui invece di continuare a chiamarla a vuoto.
-            if echo "$RESPONSE" | grep -q '"done"[[:space:]]*:[[:space:]]*true'; then
+            # (risposta reale osservata: "total_to_process": 0 con
+            # messaggio "Nessuna chat da processare."), ci fermiamo qui
+            # invece di continuare a chiamarla a vuoto.
+            if echo "$RESPONSE" | grep -q '"total_to_process"[[:space:]]*:[[:space:]]*0'; then
               echo ""
               echo "✅ Arretrato smaltito completamente dopo $i batch — interrompo il ciclo."
               exit 0
